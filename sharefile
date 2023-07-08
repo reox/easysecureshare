@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+# Proof of Concept for a easy https file share tool
+#
+# The idea is to be able to share any file on the system (the user has read access to)
+# via https. A one time URL is generated that can be used to access the file.
+# After the file has been downloaded, the script stops.
+# 
+# For each run of this script, a new certificate is generated and the public key pin is
+# added to the curl command for downloading.
+#
+# WARNING:
+# This script is a PROOF OF CONCEPT and may contain BUGS and SECURITY FLAWS!
+# USE WITH CAUTION!
+#
+#
+# Copyright (c) 2023 Sebastian Bachmann
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this 
+# software and associated documentation files (the “Software”), to deal in the Software 
+# without restriction, including without limitation the rights to use, copy, modify, 
+# merge, publish, distribute, sublicense, and/or sell copies of the Software, 
+# and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, 
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR 
+# PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE 
+# FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, 
+# TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. 
+import argparse
+import http.server
+import ssl
+import os
+import shutil
+import sys
+import secrets
+import subprocess
+import shlex
+import socket
+import tempfile
+from urllib.parse import urlparse
+
+
+class PinnedHandler(http.server.BaseHTTPRequestHandler):
+    def __init__(self, request, client_address, server, magic_filename, magic_token):
+        self.magic_filename = magic_filename
+        self.magic_token = magic_token
+        super().__init__(request, client_address, server)
+
+    def do_GET(self):
+        token, filename = os.path.split(urlparse(self.path).path)
+        token = token.lstrip('/')
+
+        if token != self.magic_token or filename != self.magic_filename:
+            return self.send_error(403)
+
+        self.send_response(200)
+        with open(filename, "rb") as f:
+            fs = os.fstat(f.fileno())
+            # TODO: content-type could be improved
+            self.send_header("Content-type", "application/octet-stream")
+            self.send_header("Content-Length", str(fs[6]))
+            self.end_headers()
+            shutil.copyfileobj(f, self.wfile)
+
+
+class PinnedHTTPServer(http.server.HTTPServer):
+    def __init__(self, server_address, RequestHandlerClass, magic_filename, magic_token, **kwargs):
+        self.magic_filename = magic_filename
+        self.magic_token = magic_token
+        super().__init__(server_address, RequestHandlerClass, **kwargs)
+
+    def finish_request(self, request, client_address):
+        self.RequestHandlerClass(request, client_address, self, self.magic_filename, self.magic_token)
+
+        
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('filename')
+    parser.add_argument('-p', '--port', default=23080, type=int)
+    parser.add_argument('-i', '--ip', default=socket.gethostbyname(socket.gethostname()))
+    args = parser.parse_args()
+
+    magic_token = secrets.token_urlsafe(64)  # 64 bytes random string
+
+    if not os.path.isfile(args.filename):
+        print(f"{args.filename} does not exists!", file=sys.stderr)
+        sys.exit(1)
+
+    with tempfile.TemporaryDirectory(suffix='_httpsshare') as tmpdir:
+        certfile = os.path.join(tmpdir, 'cert.pem')
+        keyfile = os.path.join(tmpdir, 'key.pem')
+        
+        print("Generate Certificate ...")
+        subprocess.run(shlex.split(f'openssl req -x509 -newkey rsa:2048 -keyout {keyfile} -out {certfile} -sha256 -days 1 -nodes -subj "/CN=share" -addext "subjectAltName=IP:{args.ip}"'), check=True)
+        print("done!")
+        print()
+
+        # Get the public key pin (sha256 hash of public key):
+        p = subprocess.run(shlex.split(f'openssl x509 -in {certfile} -pubkey -noout'), capture_output=True, check=True)
+        p = subprocess.run(shlex.split(f'openssl rsa -pubin -outform der'), capture_output=True, input=p.stdout, check=True)
+        p = subprocess.run(shlex.split(f'openssl dgst -sha256 -binary'), capture_output=True, input=p.stdout, check=True)
+        p = subprocess.run(shlex.split(f'openssl enc -base64'), capture_output=True, input=p.stdout, check=True)
+        pin = p.stdout.decode('ascii').strip()
+
+        print("URL to download the file:")
+        print(f'curl -O -k --pinnedpubkey "sha256//{pin}" https://{args.ip}:{args.port}/{magic_token}/{args.filename}')
+        print(" ... waiting ...")
+
+        context = ssl.SSLContext()
+        context.load_cert_chain(certfile, keyfile)
+
+        httpd = PinnedHTTPServer((args.ip, args.port), PinnedHandler, args.filename, magic_token)
+        httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+        # Handle a single request. Use server_forever() to run until stopped
+        try:
+            httpd.handle_request()
+        except KeyboardInterrupt:
+            print()
+            print("Aborting. Bye!")
+        else:
+            print("Request Handled. Bye!")
+
+
+if __name__ == "__main__":
+    main()
