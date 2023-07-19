@@ -122,11 +122,9 @@ def main():
         httpd = PinnedHTTPServer((args.ip, args.port), PinnedHandler, args.filename, magic_token)
         httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
 
-        port = args.port if args.port != 0 else httpd.socket.getsockname()[1]
-
         print("URL to download the file:")
         cmd = 'wget --no-check-certificate' if args.wget else 'curl -O -k'
-        print(f'{cmd} --pinnedpubkey "sha256//{pin}" https://{args.ip}:{port}/{magic_token}/{args.filename}')
+        print(f'{cmd} --pinnedpubkey "sha256//{pin}" https://{args.ip}:{args.port or httpd.socket.getsockname()[1]}/{magic_token}/{args.filename}')
         print(" ... waiting ...")
 
         # Handle a single request. Use server_forever() to run until stopped
