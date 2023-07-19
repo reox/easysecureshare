@@ -78,15 +78,18 @@ class PinnedHTTPServer(http.server.HTTPServer):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('filename')
-    parser.add_argument('-p', '--port', default=23080, type=int)
+    parser.add_argument('-p', '--port', default=0, type=int, help="Set the port. Use 0 to choose random port (default).")
     parser.add_argument('-i', '--ip', default=socket.gethostbyname(socket.gethostname()))
+    parser.add_argument('-w', '--wget', action="store_true", help="Print instructions for wget instead of curl")
     args = parser.parse_args()
+
+    if args.port < 0 or args.port > 65535:
+        parser.error("Port (-p/--port) must be between 0 and 65535")
 
     magic_token = secrets.token_urlsafe(64)  # 64 bytes random string
 
     if not os.path.isfile(args.filename):
-        print(f"{args.filename} does not exists!", file=sys.stderr)
-        sys.exit(1)
+        parser.error(f"File '{args.filename}' does not exists!")
 
     with tempfile.TemporaryDirectory(suffix='_httpsshare') as tmpdir:
         certfile = os.path.join(tmpdir, 'cert.pem')
@@ -104,15 +107,19 @@ def main():
         p = subprocess.run(shlex.split(f'openssl enc -base64'), capture_output=True, input=p.stdout, check=True)
         pin = p.stdout.decode('ascii').strip()
 
-        print("URL to download the file:")
-        print(f'curl -O -k --pinnedpubkey "sha256//{pin}" https://{args.ip}:{args.port}/{magic_token}/{args.filename}')
-        print(" ... waiting ...")
-
         context = ssl.SSLContext()
         context.load_cert_chain(certfile, keyfile)
 
         httpd = PinnedHTTPServer((args.ip, args.port), PinnedHandler, args.filename, magic_token)
         httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+
+        port = args.port if args.port != 0 else httpd.socket.getsockname()[1]
+
+        print("URL to download the file:")
+        cmd = 'wget --no-check-certificate' if args.wget else 'curl -O -k'
+        print(f'{cmd} --pinnedpubkey "sha256//{pin}" https://{args.ip}:{port}/{magic_token}/{args.filename}')
+        print(" ... waiting ...")
+
         # Handle a single request. Use server_forever() to run until stopped
         try:
             httpd.handle_request()
