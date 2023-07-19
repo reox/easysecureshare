@@ -78,37 +78,46 @@ class PinnedHTTPServer(http.server.HTTPServer):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('filename')
+    # TODO: Add timeout option to leave the port open only a certain amount of time
     parser.add_argument('-p', '--port', default=0, type=int, help="Set the port. Use 0 to choose random port (default).")
     parser.add_argument('-i', '--ip', default=socket.gethostbyname(socket.gethostname()))
     parser.add_argument('-w', '--wget', action="store_true", help="Print instructions for wget instead of curl")
+    parser.add_argument('--ecdsa', action="store_true", help="Generate ECDSA cert instead of RSA:2048")
+    parser.add_argument('-b', '--bytes', default=64, type=int, help="Number of random bytes in token. Set to 0 to disable.")
     args = parser.parse_args()
 
     if args.port < 0 or args.port > 65535:
         parser.error("Port (-p/--port) must be between 0 and 65535")
-
-    magic_token = secrets.token_urlsafe(64)  # 64 bytes random string
-
+    if args.bytes < 0:
+        parser.error("Number of random bytes must be positive.")
     if not os.path.isfile(args.filename):
         parser.error(f"File '{args.filename}' does not exists!")
 
+    magic_token = secrets.token_urlsafe(args.bytes)
+
     with tempfile.TemporaryDirectory(suffix='_httpsshare') as tmpdir:
+        # Key and Cert can be written in the same file
         certfile = os.path.join(tmpdir, 'cert.pem')
-        keyfile = os.path.join(tmpdir, 'key.pem')
         
         print("Generate Certificate ...")
-        subprocess.run(shlex.split(f'openssl req -x509 -newkey rsa:2048 -keyout {keyfile} -out {certfile} -sha256 -days 1 -nodes -subj "/CN=share" -addext "subjectAltName=IP:{args.ip}"'), check=True)
+        if args.ecdsa:
+            # Slightly faster than RSA
+            keyopt = "ec -pkeyopt ec_paramgen_curve:prime256v1"
+        else:
+            keyopt = "rsa:2048"
+        subprocess.run(shlex.split(f'openssl req -x509 -newkey {keyopt} -keyout {certfile} -out {certfile} -sha256 -days 1 -nodes -subj "/CN=share" -addext "subjectAltName=IP:{args.ip}"'), check=True)
         print("done!")
         print()
 
         # Get the public key pin (sha256 hash of public key):
         p = subprocess.run(shlex.split(f'openssl x509 -in {certfile} -pubkey -noout'), capture_output=True, check=True)
-        p = subprocess.run(shlex.split(f'openssl rsa -pubin -outform der'), capture_output=True, input=p.stdout, check=True)
+        p = subprocess.run(shlex.split(f'openssl {"ec" if args.ecdsa else "rsa"} -pubin -outform der'), capture_output=True, input=p.stdout, check=True)
         p = subprocess.run(shlex.split(f'openssl dgst -sha256 -binary'), capture_output=True, input=p.stdout, check=True)
         p = subprocess.run(shlex.split(f'openssl enc -base64'), capture_output=True, input=p.stdout, check=True)
         pin = p.stdout.decode('ascii').strip()
 
         context = ssl.SSLContext()
-        context.load_cert_chain(certfile, keyfile)
+        context.load_cert_chain(certfile)
 
         httpd = PinnedHTTPServer((args.ip, args.port), PinnedHandler, args.filename, magic_token)
         httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
@@ -122,6 +131,13 @@ def main():
 
         # Handle a single request. Use server_forever() to run until stopped
         try:
+            # TODO: There is a limitation here. If the request is for some reason aborted,
+            #  this daemon will shut down. Reasons for an early abort could be network issues,
+            #  but also downloading the file via a browser that shows a certificate warning,
+            #  a misspelled download link, etc.
+            # However, right now, this is a balance between security and usability.
+            # Could also test if the file was fully transmitted and then shutdown the server, but
+            # what if you leave this open in a tmux and forget about it...
             httpd.handle_request()
         except KeyboardInterrupt:
             print()
